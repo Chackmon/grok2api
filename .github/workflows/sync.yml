@@ -1,4 +1,4 @@
-name: Upstream Sync
+name: Upstream Sync (Exclude Workflows)
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+    name: Sync upstream changes excluding .github/workflows/**
     runs-on: ubuntu-latest
     if: ${{ github.event.repository.fork }}
 
@@ -81,16 +81,72 @@ jobs:
           echo "Upstream branch: $UPSTREAM_BRANCH"
           echo "Target branch: $TARGET_BRANCH"
 
-      - name: Sync upstream changes
+      - name: Sync upstream changes excluding workflows
         id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          upstream_sync_repo: ${{ steps.repo_info.outputs.upstream_repo }}
-          upstream_sync_branch: ${{ steps.repo_info.outputs.upstream_branch }}
-          target_sync_branch: ${{ steps.repo_info.outputs.target_branch }}
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          test_mode: false
+        env:
+          UPSTREAM_REPO: ${{ steps.repo_info.outputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ steps.repo_info.outputs.upstream_branch }}
+          TARGET_BRANCH: ${{ steps.repo_info.outputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+          git fetch --no-tags origin "${TARGET_BRANCH}"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          git checkout "${TARGET_BRANCH}"
+          git reset --hard "origin/${TARGET_BRANCH}"
+
+          MERGE_BASE="$(git merge-base HEAD "upstream/${UPSTREAM_BRANCH}")"
+
+          if [ -z "$MERGE_BASE" ]; then
+            echo "错误：无法找到与上游分支的共同祖先"
+            exit 1
+          fi
+
+          PATCH_FILE="$(mktemp)"
+
+          git diff --binary "$MERGE_BASE" "upstream/${UPSTREAM_BRANCH}" -- . ':(exclude).github/workflows/**' > "$PATCH_FILE"
+
+          if [ ! -s "$PATCH_FILE" ]; then
+            echo "没有需要同步的上游变更（已排除 .github/workflows/**）"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git apply -3 --index "$PATCH_FILE"; then
+            echo "同步失败：补丁应用冲突，请手动处理"
+            exit 1
+          fi
+
+          # 再次确保 workflows 目录保持为你当前仓库目标分支的版本
+          git restore --source="origin/${TARGET_BRANCH}" --staged --worktree .github/workflows || true
+
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "应用补丁后没有实际变更"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore: sync upstream ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (exclude .github/workflows)"
+          git push origin "HEAD:${TARGET_BRANCH}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Sync result
+        if: ${{ success() }}
+        run: |
+          if [ "${{ steps.sync.outputs.changed }}" = "true" ]; then
+            echo "同步完成：已推送最新上游变更（已排除 .github/workflows/**）"
+          else
+            echo "同步完成：没有需要更新的内容"
+          fi
 
       - name: Sync check
         if: ${{ failure() }}
-        run: echo "同步失败，请手动检查代码冲突"
+        run: echo "同步失败，请手动检查冲突或分支保护规则"
