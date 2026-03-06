@@ -1,44 +1,64 @@
 name: Upstream Sync
 
 permissions:
-  contents: write
+  contents: write # 允许工作流向当前仓库推送同步后的提交
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # 每 6 小时同步一次
+    - cron: "0 */6 * * *" # 每 6 小时自动同步一次
   workflow_dispatch:
+    # 手动触发时可覆盖自动识别到的仓库/分支信息
     inputs:
       upstream_repo:
-        description: "上游仓库名（例如：vercel/next.js）。留空则自动获取"
+        description: "上游仓库名（例如：vercel/next.js）。留空则自动获取 fork 的父仓库"
         required: false
         type: string
       upstream_branch:
-        description: "上游分支名。留空则自动获取默认分支"
+        description: "上游分支名。留空则自动获取上游默认分支"
         required: false
         type: string
       target_branch:
-        description: "你的目标分支名。留空则自动获取默认分支"
+        description: "你的目标分支名。留空则自动获取当前仓库默认分支"
         required: false
         type: string
 
+# 避免手动触发和定时触发同时运行，造成并发推送冲突
 concurrency:
   group: upstream-sync-${{ github.repository }}
   cancel-in-progress: true
 
 jobs:
+  # 如果当前仓库不是 fork，明确给出一条“跳过”的日志
+  skip_if_not_fork:
+    name: Skip sync on non-fork repository
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.fork }}
+    steps:
+      - name: Skip message
+        run: |
+          echo "::notice::当前仓库不是 fork 仓库，已跳过上游同步。"
+          {
+            echo "## Upstream Sync - 已跳过"
+            echo ""
+            echo "- 当前仓库：\`${{ github.repository }}\`"
+            echo "- 原因：当前仓库不是 fork 仓库"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   sync_latest_from_upstream:
     name: Sync latest commits from upstream repo
     runs-on: ubuntu-latest
     if: ${{ github.event.repository.fork }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      # 1) 检出当前仓库代码
+      - name: Checkout current repository
+        uses: actions/checkout@v6
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }} # GitHub 自动生成的临时令牌
+          fetch-depth: 0 # 拉取完整历史，便于同步前后做精确判断
 
-      - name: Resolve upstream info
+      # 2) 自动解析上游仓库、上游分支、目标分支
+      - name: Resolve upstream and target info
         id: repo_info
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -47,6 +67,8 @@ jobs:
           INPUT_TARGET_BRANCH: ${{ github.event.inputs.target_branch || '' }}
         run: |
           set -euo pipefail
+
+          echo "::group::解析仓库与分支信息"
 
           REPO_JSON="$(gh api "repos/${{ github.repository }}")"
 
@@ -59,17 +81,17 @@ jobs:
           TARGET_BRANCH="${INPUT_TARGET_BRANCH:-$AUTO_TARGET_BRANCH}"
 
           if [ -z "$UPSTREAM_REPO" ]; then
-            echo "错误：无法自动获取上游仓库，请手动填写 upstream_repo"
+            echo "::error::无法自动获取上游仓库，请手动填写 upstream_repo"
             exit 1
           fi
 
           if [ -z "$UPSTREAM_BRANCH" ]; then
-            echo "错误：无法自动获取上游分支，请手动填写 upstream_branch"
+            echo "::error::无法自动获取上游分支，请手动填写 upstream_branch"
             exit 1
           fi
 
           if [ -z "$TARGET_BRANCH" ]; then
-            echo "错误：无法自动获取目标分支，请手动填写 target_branch"
+            echo "::error::无法自动获取目标分支，请手动填写 target_branch"
             exit 1
           fi
 
@@ -77,12 +99,85 @@ jobs:
           echo "upstream_branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
           echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
 
-          echo "Upstream repo: $UPSTREAM_REPO"
-          echo "Upstream branch: $UPSTREAM_BRANCH"
-          echo "Target branch: $TARGET_BRANCH"
+          echo "::notice::上游仓库：$UPSTREAM_REPO"
+          echo "::notice::上游分支：$UPSTREAM_BRANCH"
+          echo "::notice::目标分支：$TARGET_BRANCH"
 
+          {
+            echo "## Upstream Sync - 运行信息"
+            echo ""
+            echo "- 当前仓库：\`${{ github.repository }}\`"
+            echo "- 上游仓库：\`$UPSTREAM_REPO\`"
+            echo "- 上游分支：\`$UPSTREAM_BRANCH\`"
+            echo "- 目标分支：\`$TARGET_BRANCH\`"
+            echo "- 触发方式：\`${{ github.event_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::endgroup::"
+
+      # 3) 同步前检查：如果目标分支已经包含上游最新提交，就直接跳过同步
+      - name: Pre-check whether sync is needed
+        id: precheck
+        env:
+          UPSTREAM_REPO: ${{ steps.repo_info.outputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ steps.repo_info.outputs.upstream_branch }}
+          TARGET_BRANCH: ${{ steps.repo_info.outputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::同步前检查"
+
+          # 获取目标分支和上游分支的最新状态
+          git fetch --no-tags origin "${TARGET_BRANCH}"
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream-temp/${UPSTREAM_BRANCH}"
+
+          TARGET_REF="refs/remotes/origin/${TARGET_BRANCH}"
+          UPSTREAM_REF="refs/remotes/upstream-temp/${UPSTREAM_BRANCH}"
+
+          TARGET_SHA="$(git rev-parse "${TARGET_REF}")"
+          UPSTREAM_SHA="$(git rev-parse "${UPSTREAM_REF}")"
+
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "目标分支最新提交：$TARGET_SHA"
+          echo "上游分支最新提交：$UPSTREAM_SHA"
+
+          # 如果上游最新提交已经被目标分支包含，则无需同步
+          if git merge-base --is-ancestor "${UPSTREAM_REF}" "${TARGET_REF}"; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::目标分支已经包含上游最新提交，本次无需同步。"
+
+            {
+              echo ""
+              echo "## 预检查结果"
+              echo ""
+              echo "- 目标分支已包含上游最新提交"
+              echo "- 目标 SHA：\`${TARGET_SHA}\`"
+              echo "- 上游 SHA：\`${UPSTREAM_SHA}\`"
+              echo "- 结论：**无需同步**"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::检测到上游有新的提交，准备开始同步。"
+
+            {
+              echo ""
+              echo "## 预检查结果"
+              echo ""
+              echo "- 目标 SHA：\`${TARGET_SHA}\`"
+              echo "- 上游 SHA：\`${UPSTREAM_SHA}\`"
+              echo "- 结论：**需要同步**"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "::endgroup::"
+
+      # 4) 只有在确实需要同步时，才执行同步动作
       - name: Sync upstream changes
         id: sync
+        if: ${{ steps.precheck.outputs.needs_sync == 'true' }}
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
         with:
           upstream_sync_repo: ${{ steps.repo_info.outputs.upstream_repo }}
@@ -91,6 +186,103 @@ jobs:
           target_repo_token: ${{ secrets.GITHUB_TOKEN }}
           test_mode: false
 
-      - name: Sync check
-        if: ${{ failure() }}
-        run: echo "同步失败，请手动检查代码冲突"
+      # 5) 同步后再次校验：确认目标分支已经真正包含上游最新提交
+      - name: Verify sync result
+        id: verify
+        if: ${{ steps.precheck.outputs.needs_sync == 'true' }}
+        env:
+          UPSTREAM_REPO: ${{ steps.repo_info.outputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ steps.repo_info.outputs.upstream_branch }}
+          TARGET_BRANCH: ${{ steps.repo_info.outputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::同步后校验"
+
+          git fetch --no-tags origin "${TARGET_BRANCH}"
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream-temp/${UPSTREAM_BRANCH}"
+
+          TARGET_REF="refs/remotes/origin/${TARGET_BRANCH}"
+          UPSTREAM_REF="refs/remotes/upstream-temp/${UPSTREAM_BRANCH}"
+
+          TARGET_SHA_AFTER="$(git rev-parse "${TARGET_REF}")"
+          UPSTREAM_SHA_AFTER="$(git rev-parse "${UPSTREAM_REF}")"
+
+          echo "target_sha_after=$TARGET_SHA_AFTER" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha_after=$UPSTREAM_SHA_AFTER" >> "$GITHUB_OUTPUT"
+
+          echo "同步后目标分支提交：$TARGET_SHA_AFTER"
+          echo "同步后上游分支提交：$UPSTREAM_SHA_AFTER"
+
+          if git merge-base --is-ancestor "${UPSTREAM_REF}" "${TARGET_REF}"; then
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::同步完成，目标分支已经包含上游最新提交。"
+
+            {
+              echo ""
+              echo "## 同步结果"
+              echo ""
+              echo "- 同步状态：**成功**"
+              echo "- 同步后目标 SHA：\`${TARGET_SHA_AFTER}\`"
+              echo "- 当前上游 SHA：\`${UPSTREAM_SHA_AFTER}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+            echo "::error::同步步骤执行后，目标分支仍未包含上游最新提交，请检查分支保护规则或代码冲突。"
+            exit 1
+          fi
+
+          echo "::endgroup::"
+
+      # 6) 最终总结：把本次执行结果说清楚
+      - name: Final summary
+        if: ${{ always() }}
+        env:
+          NEEDS_SYNC: ${{ steps.precheck.outputs.needs_sync || 'unknown' }}
+          SYNC_OUTCOME: ${{ steps.sync.outcome || 'skipped' }}
+          VERIFIED: ${{ steps.verify.outputs.verified || '' }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::最终结果"
+
+          if [ "$NEEDS_SYNC" = "false" ]; then
+            echo "::notice::本次运行结束：上游没有新增内容，无需同步。"
+            {
+              echo ""
+              echo "## 最终结论"
+              echo ""
+              echo "- 结果：**无需同步**"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+          elif [ "$NEEDS_SYNC" = "true" ] && [ "$SYNC_OUTCOME" = "success" ] && [ "$VERIFIED" = "true" ]; then
+            echo "::notice::本次运行结束：已成功同步上游最新提交。"
+            {
+              echo ""
+              echo "## 最终结论"
+              echo ""
+              echo "- 结果：**同步成功**"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+          elif [ "$NEEDS_SYNC" = "true" ] && [ "$SYNC_OUTCOME" = "failure" ]; then
+            echo "::error::本次运行结束：同步失败，请手动检查冲突、权限或分支保护规则。"
+            {
+              echo ""
+              echo "## 最终结论"
+              echo ""
+              echo "- 结果：**同步失败**"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+
+          else
+            echo "::warning::本次运行结束：状态异常，请查看上方详细日志。"
+            {
+              echo ""
+              echo "## 最终结论"
+              echo ""
+              echo "- 结果：**状态异常，请检查日志**"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "::endgroup::"
