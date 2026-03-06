@@ -1,0 +1,96 @@
+name: Upstream Sync
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: "0 */6 * * *" # 每 6 小时同步一次
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "上游仓库名（例如：vercel/next.js）。留空则自动获取"
+        required: false
+        type: string
+      upstream_branch:
+        description: "上游分支名。留空则自动获取默认分支"
+        required: false
+        type: string
+      target_branch:
+        description: "你的目标分支名。留空则自动获取默认分支"
+        required: false
+        type: string
+
+concurrency:
+  group: upstream-sync-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  sync_latest_from_upstream:
+    name: Sync latest commits from upstream repo
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          fetch-depth: 0
+
+      - name: Resolve upstream info
+        id: repo_info
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          INPUT_UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || '' }}
+          INPUT_UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || '' }}
+          INPUT_TARGET_BRANCH: ${{ github.event.inputs.target_branch || '' }}
+        run: |
+          set -euo pipefail
+
+          REPO_JSON="$(gh api "repos/${{ github.repository }}")"
+
+          AUTO_UPSTREAM_REPO="$(echo "$REPO_JSON" | jq -r '.parent.full_name // empty')"
+          AUTO_UPSTREAM_BRANCH="$(echo "$REPO_JSON" | jq -r '.parent.default_branch // empty')"
+          AUTO_TARGET_BRANCH="$(echo "$REPO_JSON" | jq -r '.default_branch // empty')"
+
+          UPSTREAM_REPO="${INPUT_UPSTREAM_REPO:-$AUTO_UPSTREAM_REPO}"
+          UPSTREAM_BRANCH="${INPUT_UPSTREAM_BRANCH:-$AUTO_UPSTREAM_BRANCH}"
+          TARGET_BRANCH="${INPUT_TARGET_BRANCH:-$AUTO_TARGET_BRANCH}"
+
+          if [ -z "$UPSTREAM_REPO" ]; then
+            echo "错误：无法自动获取上游仓库，请手动填写 upstream_repo"
+            exit 1
+          fi
+
+          if [ -z "$UPSTREAM_BRANCH" ]; then
+            echo "错误：无法自动获取上游分支，请手动填写 upstream_branch"
+            exit 1
+          fi
+
+          if [ -z "$TARGET_BRANCH" ]; then
+            echo "错误：无法自动获取目标分支，请手动填写 target_branch"
+            exit 1
+          fi
+
+          echo "upstream_repo=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "upstream_branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+
+          echo "Upstream repo: $UPSTREAM_REPO"
+          echo "Upstream branch: $UPSTREAM_BRANCH"
+          echo "Target branch: $TARGET_BRANCH"
+
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: ${{ steps.repo_info.outputs.upstream_repo }}
+          upstream_sync_branch: ${{ steps.repo_info.outputs.upstream_branch }}
+          target_sync_branch: ${{ steps.repo_info.outputs.target_branch }}
+          target_repo_token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          test_mode: false
+
+      - name: Sync check
+        if: ${{ failure() }}
+        run: echo "同步失败，请手动检查代码冲突"
