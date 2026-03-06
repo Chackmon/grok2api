@@ -33,15 +33,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
-          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Resolve upstream info
         id: repo_info
         env:
-          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || '' }}
           INPUT_UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || '' }}
           INPUT_TARGET_BRANCH: ${{ github.event.inputs.target_branch || '' }}
@@ -88,7 +88,7 @@ jobs:
           upstream_sync_repo: ${{ steps.repo_info.outputs.upstream_repo }}
           upstream_sync_branch: ${{ steps.repo_info.outputs.upstream_branch }}
           target_sync_branch: ${{ steps.repo_info.outputs.target_branch }}
-          target_repo_token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
           test_mode: false
 
       - name: Sync check
